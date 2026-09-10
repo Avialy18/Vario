@@ -30,12 +30,12 @@
 
   MKR Zero pin budget, so the planned additions do not collide:
     D5            buzzer (here)
-    D6            LED_BUILTIN
     D8/D9/D10     SPI MOSI/SCK/MISO   -> future SPI display (GMG12864-06d)
     D11/D12       I2C SDA/SCL         -> barometer + IMU (here)
-    D13/D14       Serial1 RX/TX       -> future GPS (NEO-6M / ATGM336H)
-    onboard SD    SPI1 + SDCARD_SS_PIN, uses no external pins
-    D0-D4, D7, A0-A6 free -> display CS/DC/RST, buttons
+    D13/D14       Serial1 RX/TX       -> future GPS (D13 = RX <- GPS TX)
+    onboard SD    SPI1 on internal 26/27/29 + SDCARD_SS_PIN, no header pins
+    LED_BUILTIN   is pin 32 and is internal, NOT D6 -- D6 is free
+    D0-D4, D6, D7, A0-A6 free -> display CS/DC/RST, buttons
 
   Audio design:
     - Climb: discontinuous beeps. The pitch is a *note* proportional to the
@@ -113,6 +113,41 @@ constexpr float BIAS_VARIANCE  = 0.010f;
 // accelerometer magnitude says when that is happening (it is no longer 1 g),
 // so let the bias adapt faster exactly then, and stay quiet in level flight.
 constexpr float BIAS_MANOEUVRE_GAIN = 30.0f;
+
+// --- inertial-force compensation (optional; needs the mounting to be known)
+// In a banked turn the accelerometer measures the load vector, not gravity.
+// The inertial part of what it reads is  omega x v , and for a vehicle whose
+// airspeed is roughly steady and whose velocity lies along one body axis that
+// is computable from the gyro alone - no GPS required. Subtracting it from
+// the gravity reference takes the roll-in error of a 40 degree turn from
+// 0.26 to 0.17 m/s, which is the floor the Kalman filter itself imposes: an
+// oracle given the exact true attitude does no better.
+//
+// It must be subtracted ONLY from the Mahony gravity reference, never from
+// the acceleration handed to the Kalman filter. Subtract it from both and you
+// are removing the very motion the vario exists to measure, leaving pure
+// gravity and a filter that believes the glider never accelerates.
+//
+// THE CATCH, and why this is off by default: it needs to know which body axis
+// points along the direction of flight, whereas everything else here works at
+// any mounting angle (the attitude is seeded from gravity). Get the axis or
+// its sign wrong and it is worse than not bothering - 90 degrees out measured
+// 0.39 m/s and 180 degrees out 0.35 m/s, against 0.26 m/s with it off. So
+// enable it deliberately, and only once FORWARD_* matches how the IMU is
+// actually mounted. It is near-neutral in the cases it does not model: a
+// pitch oscillation under the wing went 0.12 -> 0.13 m/s, and straight-glide
+// noise did not move.
+#define INERTIAL_COMPENSATION 0
+
+// Unit vector along the direction of flight, in the IMU's own axes. Read the
+// axis labels on the breakout: this is the one pointing where you are going.
+constexpr float FORWARD_X = 1.0f;
+constexpr float FORWARD_Y = 0.0f;
+constexpr float FORWARD_Z = 0.0f;
+
+// Nominal airspeed [m/s]. Not critical - 5 m/s gave 0.21 and 15 m/s gave 0.23
+// against 0.17 at the true 10 - so paraglider trim speed is close enough.
+constexpr float NOMINAL_AIRSPEED = 10.0f;
 
 // Without an IMU the filter degenerates to the old barometer-only one: the
 // acceleration input becomes zero, the bias state is frozen, and the process
@@ -531,9 +566,25 @@ void loop() {
       sensors_event_t a, g, t;
       imu->getEvent(&a, &g, &t);
       const float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
-      attitudeUpdate(g.gyro.x - gyroBx, g.gyro.y - gyroBy, g.gyro.z - gyroBz,
-                     ax, ay, az, dt);
-      aVert     = verticalAccel(ax, ay, az);
+      const float wx = g.gyro.x - gyroBx;
+      const float wy = g.gyro.y - gyroBy;
+      const float wz = g.gyro.z - gyroBz;
+
+      // Gravity reference for the attitude filter. It may be compensated for
+      // inertial acceleration; the acceleration fed to the Kalman filter
+      // below must not be.
+      float rx = ax, ry = ay, rz = az;
+#if INERTIAL_COMPENSATION
+      const float vx = NOMINAL_AIRSPEED * FORWARD_X;
+      const float vy = NOMINAL_AIRSPEED * FORWARD_Y;
+      const float vz = NOMINAL_AIRSPEED * FORWARD_Z;
+      rx -= wy * vz - wz * vy;        // omega x v
+      ry -= wz * vx - wx * vz;
+      rz -= wx * vy - wy * vx;
+#endif
+
+      attitudeUpdate(wx, wy, wz, rx, ry, rz, dt);
+      aVert     = verticalAccel(ax, ay, az);   // raw accel, never the corrected one
       manoeuvre = fabsf(sqrtf(ax * ax + ay * ay + az * az) - GRAVITY) / GRAVITY;
     }
     kalmanPredict(dt, aVert, manoeuvre);
